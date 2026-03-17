@@ -1,0 +1,469 @@
+/*************************************************
+ * ESP32-S3 Multi-Sensor System
+ * 
+ * WIRING SUMMARY:
+ * ─────────────────────────────────────────────
+ * MPU6050  + QMC5883L (I2C):
+ *   SDA  -> GPIO 8
+ *   SCL  -> GPIO 9
+ *   VCC  -> 3.3V | GND -> GND
+ *   AD0  -> GND  (MPU6050 address = 0x68)
+ *
+ * GPS NEO-6M:
+ *   TX   -> GPIO 16 (ESP RX)
+ *   RX   -> GPIO 17 (ESP TX)
+ *   VCC  -> 3.3V | GND -> GND
+ *
+ * Flame Sensor:
+ *   DO   -> GPIO 3
+ *   VCC  -> 3.3V | GND -> GND
+ *
+ * Crash Sensor (mechanical switch):
+ *   C    -> GND
+ *   NO   -> GPIO 4
+ *   NC   -> Not connected
+ *************************************************/
+
+#include <Wire.h>
+#include <math.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// =====================================================
+// ==================== PIN DEFINES ====================
+// =====================================================
+#define FLAME_DO_PIN   3
+#define CRASH_PIN      4
+#define GPS_RX_PIN     16
+#define GPS_TX_PIN     17
+#define I2C_SDA        8
+#define I2C_SCL        9
+
+// =====================================================
+// ================= I2C ADDRESSES =====================
+// =====================================================
+#define MPU6050_ADDR 0x68
+#define QMC5883_ADDR 0x0D
+
+// =====================================================
+// ================= MPU6050 REGISTERS =================
+// =====================================================
+#define MPU6050_REG_ACCEL_XOUT_H 0x3B
+#define MPU6050_REG_PWR_MGMT_1   0x6B
+#define ACCEL_SCALE 16384.0
+#define GYRO_SCALE  131.0
+
+// =====================================================
+// ================= KALMAN VARIABLES ==================
+// =====================================================
+double Q_angle = 0.001, Q_bias = 0.003, R_measure = 0.03;
+double anglePitch = 0, biasPitch = 0, Ppitch[2][2] = {{0,0},{0,0}};
+double angleRoll  = 0, biasRoll  = 0, Proll[2][2]  = {{0,0},{0,0}};
+unsigned long lastIMUTime;
+double dt;
+
+// =====================================================
+// ================= SENSOR OFFSETS ====================
+// =====================================================
+double accelOffsetX=0, accelOffsetY=0, accelOffsetZ=0;
+double gyroXOffset=0,  gyroYOffset=0,  gyroZOffset=0;
+double magOffsetX=0,   magOffsetY=0,   magOffsetZ=0;
+
+// =====================================================
+// ================= SENSOR DATA STRUCTS ===============
+// =====================================================
+struct IMUData {
+  double pitch, roll, yaw;
+  double ax, ay, az;
+  double gx, gy, gz;
+};
+
+struct GPSData {
+  bool    valid;
+  double  lat, lng;
+  int     satellites;
+  long    charsProcessed;
+};
+
+struct FlameData {
+  bool detected;
+};
+
+struct CrashData {
+  bool impact;
+};
+
+// Global data structs
+IMUData   imu;
+GPSData   gpsData;
+FlameData flame;
+CrashData crash;
+
+// =====================================================
+// ================= GPS OBJECTS =======================
+// =====================================================
+TinyGPSPlus      gps;
+HardwareSerial   GPSSerial(2);
+
+// =====================================================
+// ================= TIMING INTERVALS ==================
+// =====================================================
+#define IMU_INTERVAL     20     // ms  — 50 Hz
+#define GPS_INTERVAL     2000   // ms  — every 2 sec
+#define FLAME_INTERVAL   500    // ms  — every 0.5 sec
+#define CRASH_INTERVAL   200    // ms  — every 0.2 sec
+#define PRINT_INTERVAL   1000   // ms  — full report every 1 sec
+
+unsigned long lastIMUPrint   = 0;
+unsigned long lastGPSPrint   = 0;
+unsigned long lastFlamePrint = 0;
+unsigned long lastCrashPrint = 0;
+unsigned long lastFullPrint  = 0;
+unsigned long lastIMURead    = 0;
+
+// =====================================================
+// ===================== SETUP =========================
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // GPS
+  GPSSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  // Digital sensors
+  pinMode(FLAME_DO_PIN, INPUT);
+  pinMode(CRASH_PIN,    INPUT_PULLUP);
+
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println(  "║     ESP32-S3 MULTI-SENSOR SYSTEM     ║");
+  Serial.println(  "╚══════════════════════════════════════╝");
+
+  // Init IMU sensors
+  MPU6050_init();
+  QMC5883_init();
+
+  // Calibration
+  calibrate_MPU6050();
+  calibrate_QMC5883();
+
+  lastIMUTime = millis();
+
+  Serial.println("\n✅ All sensors initialized. Starting...\n");
+  delay(500);
+}
+
+// =====================================================
+// ====================== LOOP =========================
+// =====================================================
+void loop() {
+  unsigned long now = millis();
+
+  // --- Feed GPS parser continuously ---
+  while (GPSSerial.available() > 0) {
+    gps.encode(GPSSerial.read());
+  }
+
+  // --- Read IMU at 50Hz ---
+  if (now - lastIMURead >= IMU_INTERVAL) {
+    lastIMURead = now;
+    readAndUpdateIMU();
+  }
+
+  // --- Read flame sensor ---
+  flame.detected = (digitalRead(FLAME_DO_PIN) == LOW);
+
+  // --- Read crash sensor ---
+  crash.impact = (digitalRead(CRASH_PIN) == LOW);
+
+  // --- Update GPS struct ---
+  gpsData.valid         = gps.location.isValid();
+  gpsData.lat           = gps.location.isValid() ? gps.location.lat() : 0.0;
+  gpsData.lng           = gps.location.isValid() ? gps.location.lng() : 0.0;
+  gpsData.satellites    = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  gpsData.charsProcessed = gps.charsProcessed();
+
+  // --- Immediate crash alert (highest priority) ---
+  if (crash.impact && (now - lastCrashPrint >= CRASH_INTERVAL)) {
+    lastCrashPrint = now;
+    printCrashAlert();
+  }
+
+  // --- Immediate flame alert ---
+  if (flame.detected && (now - lastFlamePrint >= FLAME_INTERVAL)) {
+    lastFlamePrint = now;
+    printFlameAlert();
+  }
+
+  // --- Full report every second ---
+  if (now - lastFullPrint >= PRINT_INTERVAL) {
+    lastFullPrint = now;
+    printFullReport();
+  }
+}
+
+// =====================================================
+// ================= PRINT FUNCTIONS ===================
+// =====================================================
+
+void printFullReport() {
+  Serial.println("\n╔══════════════════════════════════════════════╗");
+  Serial.println(  "║            SENSOR STATUS REPORT              ║");
+  Serial.println(  "╠══════════════════════════════════════════════╣");
+
+  // IMU
+  Serial.println("║  📐 IMU (MPU6050 + QMC5883L)                 ║");
+  Serial.print(  "║  Pitch : "); Serial.print(imu.pitch, 2);
+  Serial.print(  "°  Roll : "); Serial.print(imu.roll, 2);
+  Serial.print(  "°  Yaw : "); Serial.print(imu.yaw, 2);
+  Serial.println("°");
+  Serial.print(  "║  Accel → X:"); Serial.print(imu.ax, 3);
+  Serial.print(  "  Y:"); Serial.print(imu.ay, 3);
+  Serial.print(  "  Z:"); Serial.println(imu.az, 3);
+  Serial.print(  "║  Gyro  → X:"); Serial.print(imu.gx, 3);
+  Serial.print(  "  Y:"); Serial.print(imu.gy, 3);
+  Serial.print(  "  Z:"); Serial.println(imu.gz, 3);
+
+  Serial.println("╠══════════════════════════════════════════════╣");
+
+  // GPS
+  Serial.println("║  🛰️  GPS (NEO-6M)                             ║");
+  Serial.print(  "║  Status : ");
+  Serial.println(gpsData.valid ? "✅ Fix acquired" : "⏳ Waiting for fix...");
+  Serial.print(  "║  Lat    : ");
+  if (gpsData.valid) Serial.println(gpsData.lat, 6);
+  else               Serial.println("---");
+  Serial.print(  "║  Lng    : ");
+  if (gpsData.valid) Serial.println(gpsData.lng, 6);
+  else               Serial.println("---");
+  Serial.print(  "║  Sats   : "); Serial.println(gpsData.satellites);
+  Serial.print(  "║  Chars  : "); Serial.println(gpsData.charsProcessed);
+
+  Serial.println("╠══════════════════════════════════════════════╣");
+
+  // Flame
+  Serial.println("║  🔥 Flame Sensor                              ║");
+  Serial.print(  "║  Status : ");
+  Serial.println(flame.detected ? "🔥 FLAME DETECTED!" : "✅ No flame");
+
+  Serial.println("╠══════════════════════════════════════════════╣");
+
+  // Crash
+  Serial.println("║  💥 Crash Sensor                              ║");
+  Serial.print(  "║  Status : ");
+  Serial.println(crash.impact ? "💥 IMPACT DETECTED!" : "✅ No impact");
+
+  Serial.println("╚══════════════════════════════════════════════╝");
+}
+
+void printFlameAlert() {
+  Serial.println("⚠️  ════════════════════════════════ ⚠️");
+  Serial.println("         🔥 FLAME DETECTED! 🔥");
+  Serial.println("⚠️  ════════════════════════════════ ⚠️");
+}
+
+void printCrashAlert() {
+  Serial.println("⚠️  ════════════════════════════════ ⚠️");
+  Serial.println("         💥 CRASH / IMPACT! 💥");
+  Serial.println("⚠️  ════════════════════════════════ ⚠️");
+}
+
+// =====================================================
+// ================= IMU READ + KALMAN =================
+// =====================================================
+void readAndUpdateIMU() {
+  double ax, ay, az, gx, gy, gz, mx, my, mz;
+
+  read_MPU6050(ax, ay, az, gx, gy, gz);
+  read_QMC5883(mx, my, mz);
+
+  unsigned long now = millis();
+  dt = (now - lastIMUTime) / 1000.0;
+  lastIMUTime = now;
+
+  double pitchAcc = atan2(-ax, sqrt(ay*ay + az*az)) * 180.0 / PI;
+  double rollAcc  = atan2(ay, az) * 180.0 / PI;
+
+  imu.pitch = Kalman_update(anglePitch, biasPitch, Ppitch, gx, pitchAcc);
+  imu.roll  = Kalman_update(angleRoll,  biasRoll,  Proll,  gy, rollAcc);
+
+  double pitchRad = imu.pitch * PI / 180.0;
+  double rollRad  = imu.roll  * PI / 180.0;
+
+  double Xh = mx * cos(pitchRad) + mz * sin(pitchRad);
+  double Yh = mx * sin(rollRad) * sin(pitchRad)
+            + my * cos(rollRad)
+            - mz * sin(rollRad) * cos(pitchRad);
+
+  double yawRad = atan2(Yh, Xh);
+  yawRad += 0.00727; // magnetic declination Nepal
+  if (yawRad < 0)      yawRad += 2 * PI;
+  if (yawRad > 2 * PI) yawRad -= 2 * PI;
+
+  imu.yaw = yawRad * 180.0 / PI;
+  imu.ax = ax; imu.ay = ay; imu.az = az;
+  imu.gx = gx; imu.gy = gy; imu.gz = gz;
+}
+
+// =====================================================
+// ================= MPU6050 FUNCTIONS =================
+// =====================================================
+void MPU6050_init() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(MPU6050_REG_PWR_MGMT_1);
+  Wire.write(0);
+  Wire.endTransmission(true);
+}
+
+void read_MPU6050(double &ax, double &ay, double &az,
+                  double &gx, double &gy, double &gz) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(MPU6050_REG_ACCEL_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 14, true);
+
+  int16_t rawAx = (Wire.read()<<8 | Wire.read());
+  int16_t rawAy = (Wire.read()<<8 | Wire.read());
+  int16_t rawAz = (Wire.read()<<8 | Wire.read());
+  Wire.read(); Wire.read(); // skip temp
+  int16_t rawGx = (Wire.read()<<8 | Wire.read());
+  int16_t rawGy = (Wire.read()<<8 | Wire.read());
+  int16_t rawGz = (Wire.read()<<8 | Wire.read());
+
+  ax = rawAx / ACCEL_SCALE - accelOffsetX;
+  ay = rawAy / ACCEL_SCALE - accelOffsetY;
+  az = rawAz / ACCEL_SCALE - accelOffsetZ;
+  gx = rawGx / GYRO_SCALE  - gyroXOffset;
+  gy = rawGy / GYRO_SCALE  - gyroYOffset;
+  gz = rawGz / GYRO_SCALE  - gyroZOffset;
+}
+
+void calibrate_MPU6050() {
+  Serial.println("🔧 Calibrating MPU6050 — Keep sensor FLAT...");
+  delay(2000);
+
+  double sumAx=0, sumAy=0, sumAz=0;
+  double sumGx=0, sumGy=0, sumGz=0;
+
+  for (int i = 0; i < 200; i++) {
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(MPU6050_REG_ACCEL_XOUT_H);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU6050_ADDR, 14, true);
+
+    int16_t rawAx = (Wire.read()<<8 | Wire.read());
+    int16_t rawAy = (Wire.read()<<8 | Wire.read());
+    int16_t rawAz = (Wire.read()<<8 | Wire.read());
+    Wire.read(); Wire.read();
+    int16_t rawGx = (Wire.read()<<8 | Wire.read());
+    int16_t rawGy = (Wire.read()<<8 | Wire.read());
+    int16_t rawGz = (Wire.read()<<8 | Wire.read());
+
+    sumAx += rawAx / ACCEL_SCALE;
+    sumAy += rawAy / ACCEL_SCALE;
+    sumAz += rawAz / ACCEL_SCALE;
+    sumGx += rawGx / GYRO_SCALE;
+    sumGy += rawGy / GYRO_SCALE;
+    sumGz += rawGz / GYRO_SCALE;
+    delay(10);
+  }
+
+  accelOffsetX = sumAx / 200;
+  accelOffsetY = sumAy / 200;
+  accelOffsetZ = sumAz / 200 - 1.0;
+  gyroXOffset  = sumGx / 200;
+  gyroYOffset  = sumGy / 200;
+  gyroZOffset  = sumGz / 200;
+
+  Serial.println("✅ MPU6050 calibration done!");
+}
+
+// =====================================================
+// ================= QMC5883 FUNCTIONS =================
+// =====================================================
+void QMC5883_init() {
+  Wire.beginTransmission(QMC5883_ADDR);
+  Wire.write(0x0B); Wire.write(0x01);
+  Wire.endTransmission();
+  Wire.beginTransmission(QMC5883_ADDR);
+  Wire.write(0x09); Wire.write(0x1D);
+  Wire.endTransmission();
+}
+
+void read_QMC5883(double &mx, double &my, double &mz) {
+  Wire.beginTransmission(QMC5883_ADDR);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  Wire.requestFrom(QMC5883_ADDR, 6);
+
+  int16_t x = Wire.read() | (Wire.read()<<8);
+  int16_t y = Wire.read() | (Wire.read()<<8);
+  int16_t z = Wire.read() | (Wire.read()<<8);
+
+  mx = x - magOffsetX;
+  my = y - magOffsetY;
+  mz = z - magOffsetZ;
+}
+
+void calibrate_QMC5883() {
+  Serial.println("🔧 Calibrating QMC5883 — Rotate sensor in all directions (10s)...");
+  delay(3000);
+
+  int16_t minX=32767, maxX=-32768;
+  int16_t minY=32767, maxY=-32768;
+  int16_t minZ=32767, maxZ=-32768;
+  unsigned long start = millis();
+
+  while (millis() - start < 10000) {
+    Wire.beginTransmission(QMC5883_ADDR);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    Wire.requestFrom(QMC5883_ADDR, 6);
+
+    int16_t x = Wire.read() | (Wire.read()<<8);
+    int16_t y = Wire.read() | (Wire.read()<<8);
+    int16_t z = Wire.read() | (Wire.read()<<8);
+
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    delay(100);
+  }
+
+  magOffsetX = (maxX + minX) / 2.0;
+  magOffsetY = (maxY + minY) / 2.0;
+  magOffsetZ = (maxZ + minZ) / 2.0;
+
+  Serial.println("✅ QMC5883 calibration done!");
+}
+
+// =====================================================
+// ================== KALMAN FILTER ====================
+// =====================================================
+double Kalman_update(double &angle, double &bias, double P[2][2],
+                     double gyroRate, double accAngle) {
+  double rate = gyroRate - bias;
+  angle += dt * rate;
+
+  P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
+  P[0][1] -= dt * P[1][1];
+  P[1][0] -= dt * P[1][1];
+  P[1][1] += Q_bias * dt;
+
+  double S  = P[0][0] + R_measure;
+  double K0 = P[0][0] / S;
+  double K1 = P[1][0] / S;
+
+  double y = accAngle - angle;
+  angle += K0 * y;
+  bias  += K1 * y;
+
+  double P00 = P[0][0], P01 = P[0][1];
+  P[0][0] -= K0 * P00; P[0][1] -= K0 * P01;
+  P[1][0] -= K1 * P00; P[1][1] -= K1 * P01;
+
+  return angle;
+}
