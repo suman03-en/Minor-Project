@@ -1,0 +1,182 @@
+/*************************************************
+ * ESP32-S3 UART Receiver
+ * Matches sender: pitch,roll,yaw,lat,lng,flame,crash
+ * 
+ * Wiring:
+ *   Sender  TX (GPIO4)  →  Receiver RX (GPIO18)
+ *   Sender  GND         →  Receiver GND
+ *************************************************/
+
+#include <HardwareSerial.h>
+
+// =====================================================
+// ==================== PIN DEFINES ====================
+// =====================================================
+#define RXD_PIN   18    // Connect to Sender TX (GPIO4)
+#define TXD_PIN   17    // Not used, but Serial needs a TX pin
+
+#define BAUD_RATE 115200
+
+// =====================================================
+// ==================== DATA STRUCT ====================
+// =====================================================
+struct ReceivedData {
+  double  pitch;
+  double  roll;
+  double  yaw;
+  double  lat;
+  double  lng;
+  bool    flame;
+  bool    crash;
+  bool    valid;
+};
+
+ReceivedData incoming;
+
+// =====================================================
+HardwareSerial ReceiverSerial(1);   // UART1
+
+unsigned long lastReceiveTime = 0;
+unsigned long packetCount     = 0;
+unsigned long errorCount      = 0;
+
+// =====================================================
+// ==================== PARSE CSV ======================
+// =====================================================
+bool parseCSV(String line, ReceivedData &d) {
+  line.trim();
+  if (line.length() == 0) return false;
+
+  String fields[7];
+  int count  = 0;
+  int start  = 0;
+
+  for (int i = 0; i <= (int)line.length(); i++) {
+    if (i == (int)line.length() || line[i] == ',') {
+      if (count >= 7) return false;       // too many fields
+      fields[count++] = line.substring(start, i);
+      start = i + 1;
+    }
+  }
+
+  if (count != 7) return false;           // wrong field count
+
+  d.pitch = fields[0].toDouble();
+  d.roll  = fields[1].toDouble();
+  d.yaw   = fields[2].toDouble();
+  d.lat   = fields[3].toDouble();
+  d.lng   = fields[4].toDouble();
+  d.flame = (fields[5].toInt() == 1);
+  d.crash = (fields[6].toInt() == 1);
+  d.valid = true;
+
+  return true;
+}
+
+// =====================================================
+// ==================== DISPLAY ========================
+// =====================================================
+void printSeparator(char c = '-', int len = 46) {
+  for (int i = 0; i < len; i++) Serial.print(c);
+  Serial.println();
+}
+
+void printAligned(const char* label, double value, int decimals,
+                  const char* unit = "") {
+  Serial.print("  ");
+  Serial.print(label);
+  // pad label to 12 chars
+  int pad = 14 - strlen(label);
+  for (int i = 0; i < pad; i++) Serial.print(' ');
+  Serial.print(": ");
+  Serial.print(value, decimals);
+  if (strlen(unit) > 0) { Serial.print(" "); Serial.print(unit); }
+  Serial.println();
+}
+
+void printBoolRow(const char* label, bool val,
+                  const char* onText, const char* offText) {
+  Serial.print("  ");
+  Serial.print(label);
+  int pad = 14 - strlen(label);
+  for (int i = 0; i < pad; i++) Serial.print(' ');
+  Serial.print(": ");
+  Serial.println(val ? onText : offText);
+}
+
+void displayData(ReceivedData &d) {
+  Serial.println();
+  printSeparator('=');
+  Serial.println("       ESP32-S3 RECEIVER — LIVE DATA");
+  printSeparator('=');
+
+  // ── IMU ──────────────────────────────────────────
+  Serial.println("  [ IMU ]");
+  printSeparator();
+  printAligned("Pitch",  d.pitch, 2, "deg");
+  printAligned("Roll",   d.roll,  2, "deg");
+  printAligned("Yaw",    d.yaw,   2, "deg");
+
+  // ── GPS ──────────────────────────────────────────
+  Serial.println("  [ GPS ]");
+  printSeparator();
+  if (d.lat == 0.0 && d.lng == 0.0) {
+    Serial.println("  Latitude      : -- no fix --");
+    Serial.println("  Longitude     : -- no fix --");
+  } else {
+    printAligned("Latitude",  d.lat, 6);
+    printAligned("Longitude", d.lng, 6);
+  }
+
+  // ── SENSORS ──────────────────────────────────────
+  Serial.println("  [ SENSORS ]");
+  printSeparator();
+  printBoolRow("Flame",  d.flame,
+               "⚠  DETECTED",    "OK  clear");
+  printBoolRow("Crash",  d.crash,
+               "⚠  IMPACT",      "OK  none");
+
+  // ── STATS ─────────────────────────────────────────
+  printSeparator();
+  Serial.print("  Packets OK: "); Serial.print(packetCount);
+  Serial.print("   Errors: ");    Serial.print(errorCount);
+  Serial.print("   Last: ");
+  Serial.print((millis() - lastReceiveTime) / 1000.0, 1);
+  Serial.println(" s ago");
+  printSeparator('=');
+}
+
+// =====================================================
+// ==================== SETUP ==========================
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  ReceiverSerial.begin(BAUD_RATE, SERIAL_8N1, RXD_PIN, TXD_PIN);
+
+  Serial.println();
+  printSeparator('*', 46);
+  Serial.println("   ESP32-S3 UART Receiver — Starting...");
+  Serial.println("   Waiting for data on GPIO18 (RX)");
+  printSeparator('*', 46);
+}
+
+// =====================================================
+// ==================== LOOP ===========================
+// =====================================================
+void loop() {
+  if (ReceiverSerial.available()) {
+    String line = ReceiverSerial.readStringUntil('\n');
+
+    if (parseCSV(line, incoming)) {
+      packetCount++;
+      lastReceiveTime = millis();
+      displayData(incoming);
+    } else {
+      errorCount++;
+      Serial.print("  [ERR] Bad packet (fields mismatch): ");
+      Serial.println(line);
+    }
+  }
+}
