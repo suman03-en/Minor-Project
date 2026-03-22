@@ -12,8 +12,8 @@
 // =====================================================
 // ==================== PIN DEFINES ====================
 // =====================================================
-#define RXD_PIN   18    // Connect to Sender TX (GPIO4)
-#define TXD_PIN   17    // Not used, but Serial needs a TX pin
+#define RXD_PIN   5    // Connect to Sender TX (GPIO4)
+#define TXD_PIN   4    // Not used, but Serial needs a TX pin
 
 #define BAUD_RATE 115200
 
